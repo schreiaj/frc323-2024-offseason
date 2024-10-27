@@ -52,13 +52,23 @@ public class IntakeIOSim implements IntakeIO {
           new Constraints(actuatorMaxVelocity.magnitude(), actuatorMaxAcceleration.magnitude()));
 
   private final DCMotor intakeMotor = DCMotor.getNEO(1);
-  private  final MutVoltage intakeAppliedVolts = Volts.mutable(0);
+  private final MutVoltage intakeAppliedVolts = Volts.mutable(0);
   private final double intakeMOI = 0.1;
   private final double intakeGearing = 10.0;
-
-
-
-  private final FlywheelSim intakeSim = new FlywheelSim(LinearSystemId.createFlywheelSystem(intakeMotor, intakeMOI, intakeGearing), intakeMotor);
+  private final AngularVelocity intakeMaxVelocity = DegreesPerSecond.of(360);
+  private final AngularAcceleration intakeMaxAcceleration = DegreesPerSecondPerSecond.of(360);
+  private final FlywheelSim intakeSim =
+      new FlywheelSim(
+          LinearSystemId.createFlywheelSystem(intakeMotor, intakeMOI, intakeGearing), intakeMotor);
+  private double intakeKP;
+  private double intakeKI;
+  private double intakeKD;
+  private final ProfiledPIDController intakeController =
+      new ProfiledPIDController(
+          intakeKP,
+          intakeKI,
+          intakeKD,
+          new Constraints(intakeMaxVelocity.magnitude(), intakeMaxAcceleration.magnitude()));
 
   @Override
   public void updateInputs(IntakeIOInputs inputs) {
@@ -76,26 +86,58 @@ public class IntakeIOSim implements IntakeIO {
     inputs.intakeVelocity.mut_replace(intakeSim.getAngularVelocityRadPerSec(), RadiansPerSecond);
     inputs.intakeCurrent.mut_replace(intakeSim.getCurrentDrawAmps(), Amps);
     inputs.intakeVoltage.mut_replace(intakeSim.getInputVoltage(), Volts);
-    }
+    inputs.intakeSetpoint.mut_replace(intakeController.getSetpoint().velocity, DegreesPerSecond);
+  }
 
-    @Override
-    public void runVolts(Voltage actuationVoltage, Voltage intakeVoltage) {
-      double clampedActuationVoltage = MathUtil.clamp(actuationVoltage.in(Volts),-12, 12);
-      double clampedIntakeVoltage = MathUtil.clamp(intakeVoltage.in(Volts),-12, 12);
-      actuatorAppliedVolts.mut_replace(clampedActuationVoltage, Volts);
-      intakeSim.setInputVoltage(clampedActuationVoltage);
-      intakeAppliedVolts.mut_replace(clampedIntakeVoltage, Volts);
-      intakeSim.setInputVoltage(clampedIntakeVoltage);
-    }
+  @Override
+  public void runVolts(Voltage actuationVoltage, Voltage intakeVoltage) {
+    double clampedActuationVoltage = MathUtil.clamp(actuationVoltage.in(Volts), -12, 12);
+    double clampedIntakeVoltage = MathUtil.clamp(intakeVoltage.in(Volts), -12, 12);
+    actuatorAppliedVolts.mut_replace(clampedActuationVoltage, Volts);
+    intakeSim.setInputVoltage(clampedActuationVoltage);
+    intakeAppliedVolts.mut_replace(clampedIntakeVoltage, Volts);
+    intakeSim.setInputVoltage(clampedIntakeVoltage);
+  }
 
-    @Override
-    public void runSetpoint(Angle actuationSetpoint, AngularVelocity intakeSetpoint) {
-      Angle currentActuationAngle = Radians.of(singleJointedArmSim.getAngleRads());
+  @Override
+  public void runSetpoint(Angle actuationSetpoint, AngularVelocity intakeSetpoint) {
+    Angle currentActuationAngle = Radians.of(singleJointedArmSim.getAngleRads());
+    AngularVelocity currentIntakeVelocity =
+        RadiansPerSecond.of(intakeSim.getAngularVelocityRadPerSec());
+    Angle actuationSetpointAngle = Degrees.of(actuationController.getSetpoint().position);
+    AngularVelocity actuationSetpointVelocity =
+        DegreesPerSecond.of(actuationController.getSetpoint().velocity);
+    AngularVelocity intakeSetpointVelocity =
+        DegreesPerSecond.of(intakeController.getSetpoint().velocity);
 
-      Angle actuationSetpointAngle = Degrees.of(actuationController.getSetpoint().position);
-      AngularVelocity actuationSetpointVelocity = DegreesPerSecond.of(actuationController.getSetpoint().velocity);
+    Voltage actuationVoltage =
+        Volts.of(
+            actuationController.calculate(
+                currentActuationAngle.in(Degrees), actuationSetpointAngle.in(Degrees)));
+    Voltage feedforwardVoltage =
+        actuationFF.calculate(actuationSetpointAngle, actuationSetpointVelocity);
+    Voltage intakeVoltage =
+        Volts.of(
+            intakeController.calculate(
+                currentIntakeVelocity.in(DegreesPerSecond),
+                intakeSetpointVelocity.in(DegreesPerSecond)));
 
-    }
+    this.runVolts(actuationVoltage, feedforwardVoltage);
+  }
 
-
+  @Override
+  public void setActuationPID(double kP, double kI, double kD) {
+    this.actuationController.setPID(kP, kI, kD);
+  }
+  @Override
+  public void setIntakePID(double kP, double kI, double kD) {
+    this.intakeController.setPID(kP, kI, kD);
+  }
+  @Override
+  public void stop() {
+    Angle currentActuationAngle = Radians.of(singleJointedArmSim.getAngleRads());
+    actuationController.reset(currentActuationAngle.in(Degrees));
+    intakeController.reset(0);
+    runVolts(Volts.of(0), Volts.of(0));
+  }
 }
